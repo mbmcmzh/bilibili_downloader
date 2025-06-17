@@ -1,11 +1,13 @@
 import requests
 import time
 import urllib.request
+import urllib.parse
 import re
 import os
 import sys
 from moviepy import VideoFileClip, AudioFileClip
 import subprocess
+import hashlib
 
 class BilibiliDownloader:
     """B站视频下载器"""
@@ -25,6 +27,7 @@ class BilibiliDownloader:
         self.sessdata = sessdata
         self.download_dir = os.path.join(sys.path[0], 'bili_download') # 下载存放文件夹
         self.start_time = None
+        self.wbi_keys = None
         
     def _get_headers(self, host="api.bilibili.com", referer=None):
         headers = {
@@ -41,22 +44,15 @@ class BilibiliDownloader:
         return headers
     
     def _parse_input(self, input_str):
-        aid = bvid = None
-        
-        if 'bilibili.com' in input_str:
-            if bv_match := re.search(r'/BV([a-zA-Z0-9]+)/*', input_str):
-                bvid = bv_match.group(1)
-            elif av_match := re.search(r'/av(\d+)/*', input_str):
-                aid = av_match.group(1)
-        elif input_str.isdigit():
-            aid = input_str
-        elif re.match(r'BV[a-zA-Z0-9]+', input_str):
-            bvid = input_str
+        if bv_search := re.search(r'BV[a-zA-Z0-9]+', input_str):
+            bvid = bv_search.group(0)
+        else:
+            raise Exception("输入的BV号格式不正确，或链接中不含BV号")
         
         base_url = 'https://api.bilibili.com/x/web-interface/view?'
-        api_url = base_url + (f'bvid={bvid}' if bvid else f'aid={aid}')
-            
-        return aid, bvid, api_url
+        api_url = base_url + (f'bvid={bvid}')
+        
+        return bvid, api_url
     
     def _get_video_info(self, api_url):
         try:
@@ -71,17 +67,67 @@ class BilibiliDownloader:
         except requests.RequestException as e:
             raise Exception(f"请求失败: {str(e)}")
     
-    def _get_play_list(self, aid, bvid, cid, quality):
-        # 尝试获取DASH格式
-        dash_urls = self._get_dash_play_list(aid, bvid, cid, quality)
-        if dash_urls:
-            return dash_urls
+    def _get_wbi_keys(self):
+        """获取WBI签名密钥"""
+        if self.wbi_keys:
+            return self.wbi_keys
         
-        # 回退到传统API
-        return self._get_legacy_play_list(aid, bvid, cid, quality)
+        try:
+            resp = requests.get('https://api.bilibili.com/x/web-interface/nav', headers=self._get_headers())
+            resp.raise_for_status()
+            json_content = resp.json()
+            img_url = json_content['data']['wbi_img']['img_url']
+            sub_url = json_content['data']['wbi_img']['sub_url']
+            
+            img_key = img_url.split('/')[-1].split('.')[0]
+            sub_key = sub_url.split('/')[-1].split('.')[0]
+            
+            mixin_key_enc_tab = [
+                46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+                33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+                61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+                36, 20, 34, 44, 52
+            ]
+
+            orig_key = img_key + sub_key
+            mixin_key = ''.join([orig_key[i] for i in mixin_key_enc_tab])[:32]
+            
+            self.wbi_keys = {'mixin_key': mixin_key}
+            return self.wbi_keys
+        except Exception as e:
+            raise Exception(f"获取WBI密钥失败: {e}")
+
+    def _sign_wbi_params(self, params):
+        """为WBI请求参数进行签名"""
+        try:
+            mixin_key = self._get_wbi_keys()['mixin_key']
+            curr_time = round(time.time())
+            params['wts'] = curr_time
+            
+            # 排序并移除特定字符
+            params = dict(sorted(params.items()))
+            query = urllib.parse.urlencode(params)
+            query = re.sub(r"[!'()*]", "", query) # 移除在URL编码中保留的特殊字符
+
+            w_rid = hashlib.md5((query + mixin_key).encode()).hexdigest()
+            params['w_rid'] = w_rid
+            return params
+        except Exception as e:
+            raise Exception(f"WBI签名失败: {e}")
     
-    def _get_dash_play_list(self, aid, bvid, cid, quality):
-        url_api = f'https://api.bilibili.com/x/player/wbi/playurl?cid={cid}&{"bvid="+bvid if bvid else "avid="+aid}&qn={quality}&fourk=1&fnver=0&fnval=4048'
+    def _get_dash_play_list(self, bvid, cid, quality):
+        base_url = 'https://api.bilibili.com/x/player/wbi/playurl'
+        params = {
+            'cid': cid,
+            'bvid': bvid,
+            'qn': quality,
+            'fourk': 1,
+            'fnver': 0,
+            'fnval': 4048
+        }
+        
+        signed_params = self._sign_wbi_params(params)
+        url_api = f"{base_url}?{urllib.parse.urlencode(signed_params)}"
         
         try:
             headers = self._get_headers()
@@ -99,6 +145,11 @@ class BilibiliDownloader:
             data = response.json()
             
             if data.get('code') != 0:
+                # WBI验证失败时，错误信息可能在message中，或者data中也有提示
+                error_message = data.get('message', '')
+                if 'data' in data and 'message' in data['data']:
+                    error_message += f" ({data['data']['message']})"
+                print(f"DASH API返回错误: {error_message}")
                 return None
             
             play_data = data.get('data', {})
@@ -107,7 +158,8 @@ class BilibiliDownloader:
                 return self._parse_dash_data(play_data['dash'])
             return None
                 
-        except Exception:
+        except Exception as e:
+            print(f"请求DASH API时发生异常: {e}")
             return None
     
     def _parse_dash_data(self, dash_data):
@@ -137,31 +189,6 @@ class BilibiliDownloader:
                 })
         
         return video_urls + audio_urls
-    
-    def _get_legacy_play_list(self, aid, bvid, cid, quality):
-        url_api = f'https://api.bilibili.com/x/player/playurl?cid={cid}&{"bvid="+bvid if bvid else "avid="+aid}&qn={quality}'
-        
-        try:
-            response = requests.get(url_api, headers=self._get_headers())
-            response.raise_for_status()
-            data = response.json()
-            
-            if data.get('code') != 0:
-                raise Exception(f"获取下载链接失败: {data.get('message', '未知错误')}")
-            
-            if 'data' not in data or 'durl' not in data['data']:
-                raise Exception("返回数据格式错误")
-            
-            # 转换为统一格式
-            return [{
-                'url': item['url'],
-                'backup_urls': item.get('backup_url', []),
-                'type': 'video',
-                'quality': quality,
-            } for item in data['data']['durl']]
-            
-        except requests.RequestException as e:
-            raise Exception(f"请求失败: {str(e)}")
     
     def _format_size(self, bytes_size):
         
@@ -213,9 +240,9 @@ class BilibiliDownloader:
         # 处理可能出现的为空情况
         return sanitized.strip() or "未命名视频"
     
-    def _download_media(self, media_list, title, referer_url, page):
+    def _download_media(self, media_list, part_title, title, referer_url, page):
         """下载媒体文件（视频/音频）"""
-        print(f'\n[正在下载P{page}段视频]: {title}')
+        print(f'\n[正在下载P{page}段视频]: {part_title}')
         
         # 创建下载目录
         video_path = os.path.join(self.download_dir, title)
@@ -236,7 +263,7 @@ class BilibiliDownloader:
         # 下载所有媒体文件
         for media_info in media_list:
             media_type = media_info['type']
-            filename = f'{title}-{media_type}.m4s'
+            filename = f'{part_title}-{media_type}.m4s'
             filepath = os.path.join(video_path, filename)
             
             # 尝试主URL和备用URL
@@ -260,7 +287,7 @@ class BilibiliDownloader:
         
         return downloaded_files
     
-    def _merge_media_files(self, downloaded_files, title):
+    def _merge_media_files(self, downloaded_files, title, part_title):
         """合并媒体文件"""
         video_path = os.path.join(self.download_dir, title)
         video_file = audio_file = None
@@ -271,26 +298,22 @@ class BilibiliDownloader:
                 video_file = filepath
             elif media_type == 'dash_audio':
                 audio_file = filepath
-            elif media_type == 'video':
-                # 传统视频文件直接重命名
-                os.rename(filepath, os.path.join(video_path, f'{title}.mp4'))
-                return
-        
-        # 合并DASH视频和音频
+
+        # 如果音视频文件都齐全，则合并
         if video_file and audio_file:
-            output_path = os.path.join(video_path, f'{title}.mp4')
+            output_path = os.path.join(video_path, f'{part_title}.mp4')
+            print(f"\n正在合并音视频: {part_title}.mp4")
             self._merge_with_ffmpeg(video_file, audio_file, output_path)
             
             # 清理临时文件
             try:
                 os.remove(video_file)
                 os.remove(audio_file)
-            except:
-                pass
-        elif video_file:
-            os.rename(video_file, os.path.join(video_path, f'{title}.mp4'))
-        elif audio_file:
-            os.rename(audio_file, os.path.join(video_path, f'{title}.m4a'))
+                print("临时文件清理完成")
+            except OSError as e:
+                print(f"清理临时文件失败: {e}")
+        else:
+            print("音视频文件不齐全，跳过合并步骤。")
     
     def _merge_with_ffmpeg(self, video_file, audio_file, output_path):
         """使用ffmpeg合并音视频"""
@@ -305,28 +328,7 @@ class BilibiliDownloader:
             print("音视频合并完成")
         except (subprocess.CalledProcessError, FileNotFoundError):
             # 回退到moviepy
-            print("ffmpeg不可用，尝试使用moviepy合并...")
-            self._merge_with_moviepy(video_file, audio_file, output_path)
-    
-    def _merge_with_moviepy(self, video_file, audio_file, output_path):
-        """使用moviepy合并音视频"""
-        try:
-            video_clip = VideoFileClip(video_file)
-            audio_clip = AudioFileClip(audio_file)
-            final_clip = video_clip.set_audio(audio_clip)
-            final_clip.write_videofile(
-                output_path, 
-                codec='libx264', 
-                audio_codec='aac',
-                verbose=False,
-                logger=None
-            )
-            video_clip.close()
-            audio_clip.close()
-            final_clip.close()
-            print("音视频合并完成")
-        except Exception as e:
-            raise Exception(f"moviepy合并失败: {str(e)}")
+            print("ffmpeg不可用，可能是未安装ffmpeg或未将ffmpeg添加到环境变量")
     
     def download(self, input_str, quality=80, target_page=None):
         """
@@ -339,8 +341,7 @@ class BilibiliDownloader:
         """
         try:
             # 解析输入
-            aid, bvid, api_url = self._parse_input(input_str)
-            
+            bvid, api_url = self._parse_input(input_str)
             # 获取视频信息
             video_info = self._get_video_info(api_url)
             title = self._sanitize_filename(video_info['title'])
@@ -372,31 +373,23 @@ class BilibiliDownloader:
                 if not part_title:
                     part_title = f"分P{page}"
                 
-                # 调试日志：实际验证标题内容
+                # 调试
                 print(f'原始分P标题: {page_info["part"]}')
                 print(f'处理后标题: {part_title}')
                 
                 # 构建referer URL
-                referer_url = f"https://www.bilibili.com/video/{bvid and 'BV'+bvid or 'av'+aid}/?p={page}"
+                referer_url = f"https://www.bilibili.com/video/BV{bvid}/?p={page}"
                 
                 # 获取下载链接
-                media_list = self._get_play_list(aid, bvid, cid, quality)
+                media_list = self._get_dash_play_list(bvid, cid, quality)
                 if not media_list:
                     print(f"获取下载链接失败，跳过P{page}")
                     continue
                 
                 # 下载并合并媒体文件
-                downloaded_files = self._download_media(media_list, part_title, referer_url, page)
-                self._merge_media_files(downloaded_files, part_title)
+                downloaded_files = self._download_media(media_list, part_title, title, referer_url, page)
+                self._merge_media_files(downloaded_files, title, part_title)
                 print(f'[下载完成] P{page} - {part_title}')
-            
-            # 下载完成后打开目录
-            if sys.platform == 'win32':
-                os.startfile(self.download_dir)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', self.download_dir])
-            else:
-                subprocess.Popen(['xdg-open', self.download_dir])
                     
         except Exception as e:
             print(f"下载失败: {str(e)}")
@@ -406,16 +399,16 @@ def main():
     """主程序入口"""
     print('-' * 30 + 'B站视频下载助手' + '-' * 30)
     
-    # 获取用户输入
-    video_input = input('请输入您要下载的B站av号、BV号或者视频链接地址: ')
+    # 输入BV号或链接
+    video_input = input('请输入您要下载的B站BV号或者视频链接地址: ')
     
-    # 创建下载器实例
+    # 创建实例
     downloader = BilibiliDownloader()
     
-    # 尝试解析视频信息
+    # 解析视频信息
     target_page = None
     try:
-        aid, bvid, api_url = downloader._parse_input(video_input)
+        bvid, api_url = downloader._parse_input(video_input)
         video_info = downloader._get_video_info(api_url)
         pages = video_info['pages']
         
@@ -435,17 +428,22 @@ def main():
             if len(pages) > 5:
                 print(f"  ... 还有 {len(pages) - 5} 个分P")
             
-            choice = input("\n请选择:\n1. 下载全部分P\n2. 下载指定分P\n> ").strip()
-            if choice == "2":
-                while True:
-                    try:
-                        p_input = input(f"请输入分P号 (1-{len(pages)}): ").strip()
-                        if 1 <= (p_num := int(p_input)) <= len(pages):
-                            target_page = p_num
-                            break
-                        print(f"分P号必须在 1-{len(pages)} 范围内")
-                    except ValueError:
-                        print("请输入有效的数字")
+            while True:
+                choice = input("\n请选择:\n1. 下载全部分P\n2. 下载指定分P\n> ").strip()
+                if choice == '1':
+                    break
+                if choice == "2":
+                    while True:
+                        try:
+                            p_input = input(f"请输入分P号 (1-{len(pages)}): ").strip()
+                            if 1 <= (p_num := int(p_input)) <= len(pages):
+                                target_page = p_num
+                                break
+                            print(f"分P号必须在 1-{len(pages)} 范围内")
+                        except ValueError:
+                            print("请输入有效的数字")
+                    break
+                print("无效的选择，请重新输入。")
     except:
         pass
     
