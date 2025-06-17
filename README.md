@@ -1,6 +1,7 @@
 # B站视频下载器 (Bilibili Video Downloader)
 
 一个B站视频下载工具，支持多种清晰度和分P视频下载。
+main分支为课程作业（）
 
 ## 功能特点
 
